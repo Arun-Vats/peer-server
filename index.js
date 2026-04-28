@@ -201,10 +201,10 @@ wss.on('connection', (socket, req) => {
   });
 });
 
-// ── Heartbeat watchdog — remove stale peers every 30 s ───────────────────────
+// ── Heartbeat watchdog — remove stale peers every 5 s ────────────────────────
 setInterval(() => {
   const now     = Date.now();
-  const timeout = 60_000; // 60 s without any message = stale
+  const timeout = 10_000; // 10 s without any message = stale (client reconnects after 12s)
   for (const [id, peer] of peers) {
     if (now - peer.lastSeen.getTime() > timeout) {
       console.log(`[~] Evicting stale peer: ${id}`);
@@ -212,7 +212,7 @@ setInterval(() => {
       removePeer(id);
     }
   }
-}, 30_000);
+}, 5_000);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
