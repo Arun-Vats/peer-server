@@ -39,6 +39,39 @@ app.get('/', (_req, res) => {
   res.json({ service: 'VoiceLink', online: users.size, uptime: Math.floor(process.uptime()) });
 });
 
+// TURN credentials endpoint — replaces Netlify function
+app.get('/turn', async (_req, res) => {
+  const { CF_TURN_TOKEN_ID, CF_API_TOKEN } = process.env;
+  if (!CF_TURN_TOKEN_ID || !CF_API_TOKEN) {
+    return res.status(500).json({ error: 'TURN env vars not configured on server.' });
+  }
+  try {
+    const r = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${CF_TURN_TOKEN_ID}/credentials/generate`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CF_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ttl: 86400 }),
+      }
+    );
+    if (!r.ok) {
+      const txt = await r.text();
+      console.error('[TURN]', r.status, txt);
+      return res.status(502).json({ error: 'Cloudflare TURN request failed.' });
+    }
+    const data = await r.json();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(data);
+  } catch (e) {
+    console.error('[TURN] Exception:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 io.on('connection', socket => {
   let myName = null;
 
