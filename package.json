@@ -1,0 +1,16 @@
+{
+  "name": "voicelink-server",
+  "version": "1.0.0",
+  "description": "VoiceLink P2P voice call signaling server",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.5"
+  }
+}
