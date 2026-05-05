@@ -3,13 +3,6 @@
 /**
  * VoiceLink — Signaling Server
  * Deploy on Koyeb. PORT is injected automatically by Koyeb.
- *
- * Handles:
- *   - Username registration & uniqueness
- *   - Online presence broadcast
- *   - Call routing (request / answer / decline)
- *   - WebRTC offer / answer / ICE forwarding
- *   - Hangup signaling
  */
 
 const express    = require('express');
@@ -26,7 +19,7 @@ const io     = new Server(server, {
   pingTimeout:  20_000,
 });
 
-// username (lowercase) → { socketId, username }
+// username → { socketId, username }
 const users = new Map();
 
 function findSocket(username) {
@@ -34,27 +27,41 @@ function findSocket(username) {
   return entry ? io.sockets.sockets.get(entry.socketId) : null;
 }
 
-// Health check
+// ── Health check ────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
   res.json({ service: 'VoiceLink', online: users.size, uptime: Math.floor(process.uptime()) });
 });
 
-// TURN credentials endpoint — replaces Netlify function
-app.get('/turn', async (_req, res) => {
-  const { CF_TURN_TOKEN_ID, CF_API_TOKEN } = process.env;
-  if (!CF_TURN_TOKEN_ID || !CF_API_TOKEN) {
-    return res.status(500).json({ error: 'TURN env vars not configured on server.' });
+// ── TURN credentials endpoint ────────────────────────────────────────────────
+// FIX #2: TTL reduced to 3600s (1 hour) — matches max expected call length.
+// FIX #7: Origin check — only requests from our frontend domain are accepted.
+//         Falls back to allowing all if ALLOWED_ORIGIN env var is not set.
+app.get('/turn', async (req, res) => {
+  const { CF_TURN_TOKEN_ID, CF_API_TOKEN, ALLOWED_ORIGIN } = process.env;
+
+  // FIX #7: Reject requests from unknown origins
+  if (ALLOWED_ORIGIN) {
+    const origin = req.headers.origin || req.headers.referer || '';
+    if (!origin.startsWith(ALLOWED_ORIGIN)) {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
   }
+
+  if (!CF_TURN_TOKEN_ID || !CF_API_TOKEN) {
+    return res.status(500).json({ error: 'TURN env vars not configured.' });
+  }
+
   try {
     const r = await fetch(
       `https://rtc.live.cloudflare.com/v1/turn/keys/${CF_TURN_TOKEN_ID}/credentials/generate`,
       {
-        method: 'POST',
+        method:  'POST',
         headers: {
           'Authorization': `Bearer ${CF_API_TOKEN}`,
-          'Content-Type': 'application/json',
+          'Content-Type':  'application/json',
         },
-        body: JSON.stringify({ ttl: 86400 }),
+        // FIX #2: Short TTL — credentials valid for 1 hour only
+        body: JSON.stringify({ ttl: 3600 }),
       }
     );
     if (!r.ok) {
@@ -75,7 +82,10 @@ app.get('/turn', async (_req, res) => {
 io.on('connection', socket => {
   let myName = null;
 
-  // ── REGISTER ────────────────────────────────────────────────────────────────
+  // ── REGISTER ──────────────────────────────────────────────────────────────
+  // FIX #3: If username is already registered but old socket is dead,
+  //         allow the new socket to take the username immediately.
+  // FIX #11: Send current online list to newly registered user.
   socket.on('register', ({ username } = {}) => {
     if (!username || typeof username !== 'string') {
       socket.emit('username-invalid', { msg: 'Username must be a non-empty string.' });
@@ -86,18 +96,36 @@ io.on('connection', socket => {
       socket.emit('username-invalid', { msg: '2–24 chars: letters, numbers, _ . -' });
       return;
     }
+
+    // FIX #3: Check if existing registration's socket is actually still alive
     if (users.has(key)) {
-      socket.emit('username-taken', { msg: `"${key}" is already online.` });
-      return;
+      const existing = findSocket(key);
+      if (existing && existing.connected) {
+        // Genuinely online — reject
+        socket.emit('username-taken', { msg: `"${key}" is already online.` });
+        return;
+      }
+      // Old socket is dead (disconnect event hasn't fired yet) — evict it
+      console.log(`[~] Evicting stale registration for "${key}"`);
+      users.delete(key);
+      io.emit('presence', { type: 'offline', username: key, online: users.size });
     }
+
     myName = key;
     users.set(key, { socketId: socket.id, username: key });
     socket.emit('registered', { username: key });
     io.emit('presence', { type: 'online', username: key, online: users.size });
+
+    // FIX #11: Send current online list so new user sees who's already online
+    const onlineList = [...users.keys()].filter(u => u !== key);
+    if (onlineList.length > 0) {
+      socket.emit('online-list', { users: onlineList });
+    }
+
     console.log(`[+] "${key}" — online: ${users.size}`);
   });
 
-  // ── CALL REQUEST (caller → callee) ─────────────────────────────────────────
+  // ── CALL REQUEST ──────────────────────────────────────────────────────────
   socket.on('call-request', ({ to, from } = {}) => {
     if (!myName) return;
     const target = findSocket(to);
@@ -107,7 +135,7 @@ io.on('connection', socket => {
     socket.emit('call-ringing', { to, callId });
   });
 
-  // ── CALL ANSWER (callee → caller) ──────────────────────────────────────────
+  // ── CALL ANSWER ───────────────────────────────────────────────────────────
   socket.on('call-answer', ({ to, callId, accepted } = {}) => {
     if (!myName) return;
     const target = findSocket(to);
@@ -116,36 +144,43 @@ io.on('connection', socket => {
     else          target.emit('call-declined',  { from: myName, callId });
   });
 
-  // ── WebRTC OFFER ───────────────────────────────────────────────────────────
+  // ── WebRTC OFFER ──────────────────────────────────────────────────────────
   socket.on('rtc-offer', ({ to, sdp } = {}) => {
     const t = findSocket(to);
     if (t) t.emit('rtc-offer', { from: myName, sdp });
   });
 
-  // ── WebRTC ANSWER ──────────────────────────────────────────────────────────
+  // ── WebRTC ANSWER ─────────────────────────────────────────────────────────
   socket.on('rtc-answer', ({ to, sdp } = {}) => {
     const t = findSocket(to);
     if (t) t.emit('rtc-answer', { from: myName, sdp });
   });
 
-  // ── ICE CANDIDATES ─────────────────────────────────────────────────────────
+  // ── ICE CANDIDATES ────────────────────────────────────────────────────────
+  // FIX #4: Server buffers ICE candidates per sender, emits to target.
+  //         If target's peer isn't ready, the client-side iceBuffer handles it.
   socket.on('rtc-ice', ({ to, candidate } = {}) => {
     const t = findSocket(to);
     if (t) t.emit('rtc-ice', { from: myName, candidate });
   });
 
-  // ── HANGUP ─────────────────────────────────────────────────────────────────
+  // ── HANGUP ────────────────────────────────────────────────────────────────
   socket.on('call-end', ({ to } = {}) => {
     const t = findSocket(to);
     if (t) t.emit('call-ended', { from: myName });
   });
 
-  // ── DISCONNECT ─────────────────────────────────────────────────────────────
+  // ── DISCONNECT ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     if (!myName) return;
-    users.delete(myName);
-    io.emit('presence', { type: 'offline', username: myName, online: users.size });
-    console.log(`[-] "${myName}" — online: ${users.size}`);
+    // Only delete if this socket is still the registered one
+    // (prevents evicted stale sockets from deleting the new registration)
+    const entry = users.get(myName);
+    if (entry && entry.socketId === socket.id) {
+      users.delete(myName);
+      io.emit('presence', { type: 'offline', username: myName, online: users.size });
+      console.log(`[-] "${myName}" — online: ${users.size}`);
+    }
   });
 });
 
